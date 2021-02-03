@@ -1,1067 +1,576 @@
-package com.airbnb.epoxy
+package com.airbnb.epoxy.processor
 
-import com.airbnb.epoxy.ProcessorTestUtils.assertGeneration
-import com.airbnb.epoxy.ProcessorTestUtils.assertGenerationError
-import com.airbnb.epoxy.ProcessorTestUtils.processors
-import com.google.common.truth.Truth.assert_
-import com.google.testing.compile.JavaFileObjects
-import com.google.testing.compile.JavaSourcesSubjectFactory.javaSources
-import org.junit.Test
-import javax.tools.JavaFileObject
+import com.airbnb.epoxy.AfterPropsSet
+import com.airbnb.epoxy.CallbackProp
+import com.airbnb.epoxy.ModelProp
+import com.airbnb.epoxy.ModelView
+import com.airbnb.epoxy.OnViewRecycled
+import com.airbnb.epoxy.OnVisibilityChanged
+import com.airbnb.epoxy.OnVisibilityStateChanged
+import com.airbnb.epoxy.TextProp
+import com.airbnb.epoxy.processor.Utils.isSubtypeOfType
+import net.ltgt.gradle.incap.IncrementalAnnotationProcessor
+import net.ltgt.gradle.incap.IncrementalAnnotationProcessorType
+import java.util.HashMap
+import java.util.HashSet
+import java.util.concurrent.ConcurrentHashMap
+import javax.annotation.processing.RoundEnvironment
+import javax.lang.model.element.Element
+import javax.lang.model.element.ElementKind
+import javax.lang.model.element.ExecutableElement
+import javax.lang.model.element.Modifier.PRIVATE
+import javax.lang.model.element.Modifier.STATIC
+import javax.lang.model.element.TypeElement
+import javax.lang.model.element.VariableElement
+import javax.lang.model.type.TypeKind
+import kotlin.reflect.KClass
 
-class ViewProcessorTest {
+@IncrementalAnnotationProcessor(IncrementalAnnotationProcessorType.AGGREGATING)
+class ModelViewProcessor : BaseProcessorWithPackageConfigs() {
 
-    @Test
-    fun stringOverloads() {
-        assertGeneration("TestStringOverloadsView.java", "TestStringOverloadsViewModel_.java")
+    override val usesPackageEpoxyConfig: Boolean = false
+    override val usesModelViewConfig: Boolean = true
+
+    private val modelClassMap = ConcurrentHashMap<Element, ModelViewInfo>()
+    private val styleableModelsToWrite = mutableListOf<ModelViewInfo>()
+
+    override fun additionalSupportedAnnotations(): List<KClass<*>> = listOf(
+        ModelView::class,
+        TextProp::class,
+        CallbackProp::class
+    )
+
+    override suspend fun processRound(roundEnv: RoundEnvironment, roundNumber: Int) {
+        super.processRound(roundEnv, roundNumber)
+        processViewAnnotations(roundEnv)
+
+        // Avoid doing the work to look up the rest of the annotations in model view classes
+        // if no new  model view classes were found.
+        if (modelClassMap.isNotEmpty()) {
+            processSetterAnnotations(roundEnv)
+            processResetAnnotations(roundEnv)
+            processVisibilityStateChangedAnnotations(roundEnv)
+            processVisibilityChangedAnnotations(roundEnv)
+            processAfterBindAnnotations(roundEnv)
+
+            updateViewsForInheritedViewAnnotations()
+
+            // Group overloads after inheriting methods from super classes so those can be included in
+            // the groups as well.
+            groupOverloads()
+
+            // Up until here our code generation has assumed that that all attributes in a group are
+            // view attributes (and not attributes inherited from a base model class), so this should be
+            // done after grouping attributes, and these attributes should not be grouped.
+            // No code to bind these attributes is generated, as it is assumed that the original model
+            // handles its own bind (also we can't know how to bind these).
+            updatesViewsForInheritedBaseModelAttributes()
+            addStyleAttributes()
+        }
+
+        // This may write previously generated models that were waiting for their style builder
+        // to be generated.
+        writeJava()
+
+        generatedModels.addAll(modelClassMap.values)
+        modelClassMap.clear()
     }
 
-    @Test
-    fun stringOverloads_throwsIfNotCharSequence() {
-        assertGenerationError(
-            "StringOverloads_throwsIfNotCharSequence.java",
-            "must be a CharSequence"
-        )
+    private suspend fun processViewAnnotations(roundEnv: RoundEnvironment) {
+        roundEnv.getElementsAnnotatedWith(ModelView::class)
+            .forEach("processViewAnnotations") { viewElement ->
+                if (!validateViewElement(viewElement)) {
+                    return@forEach
+                }
+
+                modelClassMap[viewElement] = ModelViewInfo(
+                    viewElement as TypeElement,
+                    typeUtils,
+                    elementUtils,
+                    logger,
+                    configManager,
+                    resourceProcessor,
+                    memoizer
+                )
+            }
     }
 
-    @Test
-    fun nullStringOverloads() {
-        assertGeneration(
-            "TestNullStringOverloadsView.java",
-            "TestNullStringOverloadsViewModel_.java"
-        )
-    }
-
-    @Test
-    fun manyTypes() {
-        assertGeneration("TestManyTypesView.java", "TestManyTypesViewModel_.java")
-    }
-
-    @Test
-    fun prop_throwsIfPrivate() {
-        assertGenerationError("Prop_throwsIfPrivate.java", "private")
-    }
-
-    @Test
-    fun prop_throwsIfStatic() {
-        assertGenerationError("Prop_throwsIfStatic.java", "static")
-    }
-
-    @Test
-    fun prop_throwsIfNoParams() {
-        assertGenerationError("Prop_throwsIfNoParams.java", "must have exactly 1 parameter")
-    }
-
-    @Test
-    fun prop_throwsIfMultipleParams() {
-        assertGenerationError("Prop_throwsIfMultipleParams.java", "must have exactly 1 parameter")
-    }
-
-    @Test
-    fun groups() {
-        assertGeneration("PropGroupsView.java", "PropGroupsViewModel_.java")
-    }
-
-    @Test
-    fun defaults() {
-        assertGeneration("PropDefaultsView.java", "PropDefaultsViewModel_.java")
-    }
-
-    @Test
-    fun defaults_throwsForNonStaticValue() {
-        assertGenerationError("PropDefaultsView_throwsForNonStaticValue.java", "static")
-    }
-
-    @Test
-    fun defaults_throwsForNonFinalValue() {
-        assertGenerationError("PropDefaultsView_throwsForNonFinalValue.java", "final")
-    }
-
-    @Test
-    fun defaults_throwsForPrivateValue() {
-        assertGenerationError("PropDefaultsView_throwsForPrivateValue.java", "final")
-    }
-
-    @Test
-    fun defaults_throwsForWrongType() {
-        assertGenerationError("PropDefaultsView_throwsForWrongType.java", "must be a int")
-    }
-
-    @Test
-    fun defaults_throwsForNotFound() {
-        assertGenerationError("PropDefaultsView_throwsForNotFound.java", "could not be found")
-    }
-
-    @Test
-    fun onViewRecycled() {
-        assertGeneration("OnViewRecycledView.java", "OnViewRecycledViewModel_.java")
-    }
-
-    @Test
-    fun onViewRecycled_throwsIfPrivate() {
-        assertGenerationError("OnViewRecycledView_throwsIfPrivate.java", "private")
-    }
-
-    @Test
-    fun onViewRecycled_throwsIfStatic() {
-        assertGenerationError("OnViewRecycledView_throwsIfStatic.java", "static")
-    }
-
-    @Test
-    fun onViewRecycled_throwsIfHasParams() {
-        assertGenerationError(
-            "OnViewRecycledView_throwsIfHasParams.java",
-            "must have exactly 0 parameter"
-        )
-    }
-
-    @Test
-    fun onVisibilityChanged() {
-        assertGeneration(
-            "OnVisibilityChangedView.java",
-            "OnVisibilityChangedViewModel_.java"
-        )
-    }
-
-    @Test
-    fun onVisibilityChanged_throwsIfPrivate() {
-        assertGenerationError(
-            "OnVisibilityChangedView_throwsIfPrivate.java",
-            "private"
-        )
-    }
-
-    @Test
-    fun onVisibilityChanged_throwsIfStatic() {
-        assertGenerationError(
-            "OnVisibilityChangedView_throwsIfStatic.java",
-            "static"
-        )
-    }
-
-    @Test
-    fun onVisibilityChanged_throwsIfInvalidParams() {
-        assertGenerationError(
-            "OnVisibilityChangedView_throwsIfInvalidParams.java",
-            "must have parameter types [FLOAT, FLOAT, INT, INT], " +
-                "found: [BOOLEAN, BOOLEAN, INT, INT] (method: onVisibilityChanged)"
-        )
-    }
-
-    @Test
-    fun onVisibilityChanged_throwsIfNoParams() {
-        assertGenerationError(
-            "OnVisibilityChangedView_throwsIfNoParams.java",
-            "must have exactly 4 parameter (method: onVisibilityChanged)"
-        )
-    }
-
-    @Test
-    fun onVisibilityStateChanged() {
-        assertGeneration(
-            "OnVisibilityStateChangedView.java",
-            "OnVisibilityStateChangedViewModel_.java"
-        )
-    }
-
-    @Test
-    fun onVisibilityStateChanged_throwsIfPrivate() {
-        assertGenerationError(
-            "OnVisibilityStateChangedView_throwsIfPrivate.java",
-            "private"
-        )
-    }
-
-    @Test
-    fun onVisibilityStateChanged_throwsIfStatic() {
-        assertGenerationError(
-            "OnVisibilityStateChangedView_throwsIfStatic.java",
-            "static"
-        )
-    }
-
-    @Test
-    fun onVisibilityStateChanged_throwsIfInvalidParams() {
-        assertGenerationError(
-            "OnVisibilityStateChangedView_throwsIfInvalidParams.java",
-            "must have parameter types [INT], found: [BOOLEAN] (method: onVisibilityStateChanged)"
-        )
-    }
-
-    @Test
-    fun onVisibilityStateChanged_throwsIfNoParams() {
-        assertGenerationError(
-            "OnVisibilityStateChangedView_throwsIfNoParams.java",
-            "must have exactly 1 parameter (method: onVisibilityStateChanged)"
-        )
-    }
-
-    @Test
-    fun nullOnRecycle() {
-        assertGeneration("NullOnRecycleView.java", "NullOnRecycleViewModel_.java")
-    }
-
-    @Test
-    fun nullOnRecycle_throwsIfNotNullable() {
-        assertGenerationError("NullOnRecycleView_throwsIfNotNullable.java", "@Nullable")
-    }
-
-    @Test
-    fun doNotHash() {
-        assertGeneration("DoNotHashView.java", "DoNotHashViewModel_.java")
-    }
-
-    @Test
-    fun objectWithoutEqualsThrows() {
-        assertGenerationError(
-            "ObjectWithoutEqualsThrowsView.java",
-            "Attribute does not implement hashCode"
-        )
-    }
-
-    @Test
-    fun ignoreRequireHashCode() {
-        assertGeneration("IgnoreRequireHashCodeView.java", "IgnoreRequireHashCodeViewModel_.java")
-    }
-
-    @Test
-    fun savedState() {
-        assertGeneration("SavedStateView.java", "SavedStateViewModel_.java")
-    }
-
-    @Test
-    fun gridSpanCount() {
-        assertGeneration("GridSpanCountView.java", "GridSpanCountViewModel_.java")
-    }
-
-    @Test
-    fun baseModel() {
-        val model = JavaFileObjects
-            .forResource("BaseModelView.java".patchResource())
-
-        val baseModel = JavaFileObjects
-            .forSourceLines(
-                "com.airbnb.epoxy.TestBaseModel",
-                "package com.airbnb.epoxy;\n" +
-                    "\n" +
-                    "import android.widget.FrameLayout;\n" +
-                    "\n" +
-                    "import java.util.List;\n" +
-                    "\n" +
-                    "public abstract class TestBaseModel<T extends FrameLayout> " +
-                    "extends EpoxyModel<T> {\n" +
-                    " public TestBaseModel(long id) { super(id); }" +
-                    "\n" +
-                    "  @Override\n" +
-                    "  public void bind(T view) {\n" +
-                    "    super.bind(view);\n" +
-                    "  }\n" +
-                    "\n" +
-                    "  @Override\n" +
-                    "  public void bind(T view, List<Object> payloads) {\n" +
-                    "    super.bind(view, payloads);\n" +
-                    "  }\n" +
-                    "}\n"
+    private fun validateViewElement(viewElement: Element): Boolean {
+        if (viewElement.kind != ElementKind.CLASS || viewElement !is TypeElement) {
+            logger.logError(
+                "${ModelView::class.java} annotations can only be on a class " +
+                    "(element: ${viewElement.simpleName})"
             )
+            return false
+        }
 
-        val generatedModel = JavaFileObjects.forResource("BaseModelViewModel_.java".patchResource())
-
-        assert_().about(javaSources())
-            .that(listOf(baseModel, model))
-            .processedWith(processors())
-            .compilesWithoutError()
-            .and()
-            .generatesSources(generatedModel)
-    }
-
-    @Test
-    fun baseModelWithDiffBind() {
-        val baseModel = JavaFileObjects.forSourceLines(
-            "com.airbnb.epoxy.TestBaseModel",
-            "package com.airbnb.epoxy;\n" +
-                "\n" +
-                "import android.widget.FrameLayout;\n" +
-                "\n" +
-                "public abstract class TestBaseModel<T extends FrameLayout> " +
-                "extends EpoxyModel<T> {\n" +
-                "@Override\n" +
-                "  public void bind(T view, EpoxyModel<?> previouslyBoundModel) {\n" +
-                "    super.bind(view, previouslyBoundModel);\n" +
-                "  }" +
-                "}"
-        )
-
-        assertGeneration(
-            sourceFileNames = listOf("BaseModelView.java"),
-            sourceObjects = listOf(baseModel),
-            generatedFileNames = listOf("BaseModelViewWithSuperDiffBindModel_.java")
-        )
-    }
-
-    @Test
-    fun baseModelWithAttribute() {
-        val model = JavaFileObjects
-            .forResource("BaseModelView.java".patchResource())
-
-        val baseModel = JavaFileObjects.forSourceLines(
-            "com.airbnb.epoxy.TestBaseModel",
-            "package com.airbnb.epoxy;\n" +
-                "\n" +
-                "import android.widget.FrameLayout;\n" +
-                "\n" +
-                "public abstract class TestBaseModel<T extends FrameLayout> " +
-                "extends EpoxyModel<T> {\n" +
-                "  @EpoxyAttribute String baseModelString;\n" +
-                "}\n"
-        )
-
-        val generatedModel =
-            JavaFileObjects.forResource("BaseModelWithAttributeViewModel_.java".patchResource())
-
-        assert_().about(javaSources())
-            .that(listOf(baseModel, model))
-            .processedWith(processors())
-            .compilesWithoutError()
-            .and()
-            .generatesSources(generatedModel)
-    }
-
-    @Test
-    fun throwsIfBaseModelNotEpoxyModel() {
-        val model = JavaFileObjects
-            .forSourceLines(
-                "com.airbnb.epoxy.BaseModelView",
-                "package com.airbnb.epoxy;\n" +
-                    "\n" +
-                    "import android.content.Context;\n" +
-                    "import android.widget.FrameLayout;\n" +
-                    "\n" +
-                    "@ModelView(defaultLayout = 1, baseModelClass = TestBaseModel.class)\n" +
-                    "public class BaseModelView extends FrameLayout {\n" +
-                    "\n" +
-                    "  public BaseModelView(Context context) {\n" +
-                    "    super(context);\n" +
-                    "  }\n" +
-                    "\n" +
-                    "  @ModelProp\n" +
-                    "  public void setClickListener(String title) {\n" +
-                    "\n" +
-                    "  }\n" +
-                    "}"
+        val modifiers = viewElement.modifiersThreadSafe
+        if (modifiers.contains(PRIVATE)) {
+            logger.logError(
+                "${ModelView::class.java} annotations must not be on private classes. " +
+                    "(class: ${viewElement.getSimpleName()})"
             )
+            return false
+        }
 
-        val baseModel = JavaFileObjects
-            .forSourceLines(
-                "com.airbnb.epoxy.TestBaseModel",
-                "package com.airbnb.epoxy;\n" +
-                    "\n" +
-                    "public abstract class TestBaseModel{\n" +
-                    "}\n"
+        // Nested classes must be static
+        if (viewElement.nestingKind.isNested) {
+            logger.logError(
+                "Classes with ${ModelView::class.java} annotations cannot be nested. " +
+                    "(class: ${viewElement.getSimpleName()})"
             )
+            return false
+        }
 
-        assert_().about(javaSources())
-            .that(listOf(baseModel, model))
-            .processedWith(processors())
-            .failsToCompile()
-            .withErrorContaining(
-                "The base model provided to an ModelView must extend EpoxyModel"
+        if (!isSubtypeOfType(viewElement.asType(), Utils.ANDROID_VIEW_TYPE)) {
+            logger.logError(
+                "Classes with ${ModelView::class.java} annotations must extend " +
+                    "android.view.View. (class: ${viewElement.getSimpleName()})"
             )
+            return false
+        }
+
+        return true
     }
 
-    @Test
-    fun baseModelFromPackageConfig() {
-        val model = JavaFileObjects
-            .forSourceLines(
-                "com.airbnb.epoxy.BaseModelView",
-                "package com.airbnb.epoxy;\n" +
-                    "\n" +
-                    "import android.content.Context;\n" +
-                    "import android.widget.FrameLayout;\n" +
-                    "\n" +
-                    "@ModelView(defaultLayout = 1)\n" +
-                    "public class BaseModelView extends FrameLayout {\n" +
-                    "\n" +
-                    "  public BaseModelView(Context context) {\n" +
-                    "    super(context);\n" +
-                    "  }\n" +
-                    "\n" +
-                    "  @ModelProp\n" +
-                    "  public void setClickListener(String title) {\n" +
-                    "\n" +
-                    "  }\n" +
-                    "}"
+    private suspend fun processSetterAnnotations(roundEnv: RoundEnvironment) {
+
+        for (propAnnotation in modelPropAnnotations) {
+            roundEnv.getElementsAnnotatedWith(propAnnotation)
+                .map("Process ${propAnnotation.simpleName}") { prop ->
+                    // Interfaces can use model property annotations freely, they will be processed if
+                    // and when implementors of that interface are processed. This is particularly
+                    // useful for Kotlin delegation where the model view class may not be overriding
+                    // the interface properties directly, and so doesn't have an opportunity to annotate
+                    // them with Epoxy model property annotations.
+                    if (prop.enclosingElement.kind == ElementKind.INTERFACE) {
+                        return@map null
+                    }
+
+                    val info = getModelInfoForPropElement(prop)
+                    if (info == null) {
+                        logger.logError(
+                            "${propAnnotation.simpleName} annotation can only be used in classes " +
+                                "annotated with ${ModelView::class.java.simpleName} " +
+                                "(${prop.enclosingElement.simpleName}#${prop.simpleName})"
+                        )
+                        return@map null
+                    }
+
+                    // JvmOverloads is used on properties with default arguments, which we support.
+                    // However, the generated no arg version of the function will also have the
+                    // @ModelProp annotation so we need to ignore it when it is processed.
+                    // However, the JvmOverloads annotation is removed in the java class so we need
+                    // to manually look for a valid overload function.
+                    if (prop is ExecutableElement &&
+                        prop.parametersThreadSafe.isEmpty() &&
+                        info.viewElement.findOverload(
+                            prop,
+                            1
+                        )?.hasAnyAnnotation(modelPropAnnotations) == true
+                    ) {
+                        return@map null
+                    }
+
+                    if (!validatePropElement(prop, propAnnotation.java)) {
+                        return@map null
+                    }
+
+                    info.buildProp(prop) to info
+                }.forEach { (viewProp, modelInfo) ->
+                    // This is done synchronously after the parallel prop building so that we
+                    // have all props in the order they are listed in the view.
+                    // This keeps a consistent ordering despite the parallel execution, which is necessary
+                    // for consistent generated code as well as consistent prop binding order (which
+                    // people are not supposed to rely on, but inevitably do, and we want to avoid breaking
+                    // that by changing the ordering).
+                    modelInfo.addAttribute(viewProp)
+                }
+        }
+    }
+
+    private suspend fun groupOverloads() {
+        modelClassMap.values.forEach("groupOverloads") { viewInfo ->
+            val attributeGroups = HashMap<String, MutableList<AttributeInfo>>()
+
+            // Track which groups are created manually by the user via a group annotation param.
+            // We use this to check that more than one setter is in the group, since otherwise it
+            // doesn't make sense to have a group and there is likely a typo we can catch for them
+            val customGroups = HashSet<String>()
+
+            for (attributeInfo in viewInfo.attributeInfo) {
+                val setterInfo = attributeInfo as ViewAttributeInfo
+
+                var groupKey = setterInfo.groupKey!!
+                if (groupKey.isEmpty()) {
+                    // Default to using the method name as the group name, so method overloads are
+                    // grouped together by default
+                    groupKey = setterInfo.viewAttributeName
+                } else {
+                    customGroups.add(groupKey)
+                }
+
+                attributeGroups
+                    .getOrPut(groupKey) { mutableListOf() }
+                    .add(attributeInfo)
+            }
+
+            for (customGroup in customGroups) {
+                attributeGroups[customGroup]?.let {
+                    if (it.size == 1) {
+                        val attribute = it[0] as ViewAttributeInfo
+                        logger.logError(
+                            "Only one setter was included in the custom group " +
+                                "'$customGroup' at ${viewInfo.viewElement.simpleName}#" +
+                                "${attribute.viewAttributeName}. Groups should have at " +
+                                "least 2 setters."
+                        )
+                    }
+                }
+            }
+
+            for ((groupKey, groupAttributes) in attributeGroups) {
+                viewInfo.addAttributeGroup(groupKey, groupAttributes)
+            }
+        }
+    }
+
+    private fun validatePropElement(
+        prop: Element,
+        propAnnotation: Class<out Annotation>
+    ): Boolean {
+        return when (prop) {
+            is ExecutableElement -> validateExecutableElement(prop, propAnnotation, 1)
+            is VariableElement -> validateVariableElement(prop, propAnnotation)
+            else -> {
+                logger.logError(
+                    "%s annotations can only be on a method or a field(element: %s)",
+                    propAnnotation,
+                    prop.simpleName
+                )
+                return false
+            }
+        }
+    }
+
+    private fun validateVariableElement(field: Element, annotationClass: Class<*>): Boolean {
+        val isValidField = field.kind == ElementKind.FIELD &&
+            !field.modifiersThreadSafe.contains(PRIVATE) &&
+            !field.modifiersThreadSafe.contains(STATIC)
+
+        if (!isValidField) {
+            logger.logError(
+                "Field annotated with %s must not be static or private (field: %s)",
+                annotationClass, field
             )
+        }
+        return isValidField
+    }
 
-        val configClass = JavaFileObjects.forSourceString(
-            "com.airbnb.epoxy.EpoxyModelViewConfig",
-            """
-                    package com.airbnb.epoxy;
-                    
-                    import com.airbnb.epoxy.PackageModelViewConfig;
-                    import com.airbnb.epoxy.R;
-                    import com.airbnb.epoxy.TestBaseModel;
-                    
-                    @PackageModelViewConfig(rClass = R.class, defaultBaseModelClass = TestBaseModel.class)
-                    interface EpoxyModelViewConfig {}
-            """.trimIndent()
-        )
-
-        val baseModel = JavaFileObjects
-            .forSourceLines(
-                "com.airbnb.epoxy.TestBaseModel",
-                "package com.airbnb.epoxy;\n" +
-                    "\n" +
-                    "import android.view.View;\n" +
-                    "\n" +
-                    "public abstract class TestBaseModel<T extends View> " +
-                    "extends EpoxyModel<T> {\n" +
-                    "}\n"
+    private fun validateExecutableElement(
+        element: Element,
+        annotationClass: Class<*>,
+        paramCount: Int,
+        checkTypeParameters: List<TypeKind>? = null
+    ): Boolean {
+        if (element !is ExecutableElement) {
+            logger.logError(
+                "%s annotations can only be on a method (element: %s)",
+                annotationClass::class.java.simpleName,
+                element.simpleName
             )
+            return false
+        }
 
-        val generatedModel = JavaFileObjects.forResource(
-            "BaseModelFromPackageConfigViewModel_.java".patchResource()
-        )
-
-        assert_().about(javaSources())
-            .that(listOf(baseModel, model, configClass, R))
-            .processedWith(processors())
-            .compilesWithoutError()
-            .and()
-            .generatesSources(generatedModel)
-    }
-
-    @Test
-    fun baseModelFromPackageConfigIsOverriddenByViewSetting() {
-        // If a package default is set for the base model it can be overridden if the view sets its
-        // own base model
-
-        val model = JavaFileObjects
-            .forSourceLines(
-                "com.airbnb.epoxy.BaseModelView",
-                "package com.airbnb.epoxy;\n" +
-                    "\n" +
-                    "import android.content.Context;\n" +
-                    "import android.view.View;\n" +
-                    "\n" +
-                    "@ModelView(defaultLayout = 1, baseModelClass = EpoxyModel.class)\n" +
-                    "public class BaseModelView extends View {\n" +
-                    "\n" +
-                    "  public BaseModelView(Context context) {\n" +
-                    "    super(context);\n" +
-                    "  }\n" +
-                    "\n" +
-                    "  @ModelProp\n" +
-                    "  public void setClickListener(String title) {\n" +
-                    "\n" +
-                    "  }\n" +
-                    "}"
+        val parameters = element.parametersThreadSafe
+        if (parameters.size != paramCount) {
+            logger.logError(
+                "Methods annotated with %s must have exactly %s parameter (method: %s)",
+                annotationClass::class.java.simpleName, paramCount, element.getSimpleName()
             )
+            return false
+        }
 
-        val configClass = JavaFileObjects.forSourceString(
-            "com.airbnb.epoxy.EpoxyModelViewConfig",
-            """
-                    package com.airbnb.epoxy;
-                    
-                    import com.airbnb.epoxy.PackageModelViewConfig;
-                    import com.airbnb.epoxy.R;
-                    import com.airbnb.epoxy.TestBaseModel;
-                    
-                    @PackageModelViewConfig(rClass = R.class, defaultBaseModelClass = TestBaseModel.class)
-                    interface EpoxyModelViewConfig {}
-            """.trimIndent()
-        )
+        checkTypeParameters?.let { expectedTypeParameters ->
+            // Check also the parameter types
+            var hasErrors = false
+            parameters.forEachIndexed { i, parameter ->
+                hasErrors = hasErrors || parameter.asType().kind != expectedTypeParameters[i]
+            }
+            if (hasErrors) {
+                logger.logError(
+                    "Methods annotated with %s must have parameter types %s, " +
+                        "found: %s (method: %s)",
+                    annotationClass::class.java.simpleName,
+                    expectedTypeParameters,
+                    parameters.map { it.asType().kind },
+                    element.simpleName
+                )
+            }
+        }
 
-        val baseModel = JavaFileObjects
-            .forSourceLines(
-                "com.airbnb.epoxy.TestBaseModel",
-                "package com.airbnb.epoxy;\n" +
-                    "\n" +
-                    "import android.view.View;\n" +
-                    "\n" +
-                    "public abstract class TestBaseModel<T extends View> " +
-                    "extends EpoxyModel<T> {\n" +
-                    "}\n"
+        val modifiers = element.modifiersThreadSafe
+        if (modifiers.contains(STATIC) || modifiers.contains(PRIVATE)) {
+            logger.logError(
+                "Methods annotated with %s cannot be private or static (method: %s)",
+                annotationClass::class.java.simpleName, element.getSimpleName()
             )
+            return false
+        }
 
-        val generatedModel = JavaFileObjects.forResource(
-            "BaseModelOverridesPackageConfigViewModel_.java".patchResource()
+        return true
+    }
+
+    private suspend fun processResetAnnotations(roundEnv: RoundEnvironment) {
+        roundEnv.getElementsAnnotatedWith(OnViewRecycled::class)
+            .map("processResetAnnotations") { recycleMethod ->
+                if (!validateResetElement(recycleMethod)) {
+                    return@map null
+                }
+
+                val info = getModelInfoForPropElement(recycleMethod)
+                if (info == null) {
+                    logger.logError(
+                        "%s annotation can only be used in classes annotated with %s",
+                        OnViewRecycled::class.java, ModelView::class.java
+                    )
+                    return@map null
+                }
+
+                recycleMethod.simpleName.toString() to info
+            }.forEach { (methodName, modelInfo) ->
+                // Do this after, synchronously, to preserve function ordering in the view.
+                // If there are multiple functions with this annotation this allows them
+                // to be called in predictable order from top to bottom of the class, which
+                // some users may depend on.
+                modelInfo.addOnRecycleMethod(methodName)
+            }
+    }
+
+    private suspend fun processVisibilityStateChangedAnnotations(roundEnv: RoundEnvironment) {
+        roundEnv.getElementsAnnotatedWith(OnVisibilityStateChanged::class)
+            .map("processVisibilityStateChangedAnnotations") { visibilityMethod ->
+                if (!validateVisibilityStateChangedElement(visibilityMethod)) {
+                    return@map null
+                }
+
+                val info = getModelInfoForPropElement(visibilityMethod)
+                if (info == null) {
+                    logger.logError(
+                        "%s annotation can only be used in classes annotated with %s",
+                        OnVisibilityStateChanged::class.java, ModelView::class.java
+                    )
+                    return@map null
+                }
+
+                visibilityMethod.simpleName.toString() to info
+            }.forEach { (methodName, modelInfo) ->
+                // Do this after, synchronously, to preserve function ordering in the view.
+                // If there are multiple functions with this annotation this allows them
+                // to be called in predictable order from top to bottom of the class, which
+                // some users may depend on.
+                modelInfo.addOnVisibilityStateChangedMethod(methodName)
+            }
+    }
+
+    private suspend fun processVisibilityChangedAnnotations(roundEnv: RoundEnvironment) {
+        roundEnv.getElementsAnnotatedWith(OnVisibilityChanged::class)
+            .map("processVisibilityChangedAnnotations") { visibilityMethod ->
+                if (!validateVisibilityChangedElement(visibilityMethod)) {
+                    return@map null
+                }
+
+                val info = getModelInfoForPropElement(visibilityMethod)
+                if (info == null) {
+                    logger.logError(
+                        "%s annotation can only be used in classes annotated with %s",
+                        OnVisibilityChanged::class.java, ModelView::class.java
+                    )
+                    return@map null
+                }
+
+                visibilityMethod.simpleName.toString() to info
+            }.forEach { (methodName, modelInfo) ->
+                // Do this after, synchronously, to preserve function ordering in the view.
+                // If there are multiple functions with this annotation this allows them
+                // to be called in predictable order from top to bottom of the class, which
+                // some users may depend on.
+                modelInfo.addOnVisibilityChangedMethod(methodName)
+            }
+    }
+
+    private suspend fun processAfterBindAnnotations(roundEnv: RoundEnvironment) {
+        roundEnv.getElementsAnnotatedWith(AfterPropsSet::class)
+            .map("processAfterBindAnnotations") { afterPropsMethod ->
+                if (!validateAfterPropsMethod(afterPropsMethod)) {
+                    return@map null
+                }
+
+                val info = getModelInfoForPropElement(afterPropsMethod)
+                if (info == null) {
+                    logger.logError(
+                        "%s annotation can only be used in classes annotated with %s",
+                        AfterPropsSet::class.java, ModelView::class.java
+                    )
+                    return@map null
+                }
+
+                afterPropsMethod.simpleName.toString() to info
+            }.forEach { (methodName, modelInfo) ->
+                // Do this after, synchronously, to preserve function ordering in the view.
+                // If there are multiple functions with this annotation this allows them
+                // to be called in predictable order from top to bottom of the class, which
+                // some users may depend on.
+                modelInfo.addAfterPropsSetMethod(methodName)
+            }
+    }
+
+    private fun validateAfterPropsMethod(resetMethod: Element): Boolean =
+        validateExecutableElement(resetMethod, AfterPropsSet::class.java, 0)
+
+    /** Include props and reset methods from super class views.  */
+    private suspend fun updateViewsForInheritedViewAnnotations() {
+
+        modelClassMap.values.forEach("updateViewsForInheritedViewAnnotations") { view ->
+            // We walk up the super class tree and look for any elements with epoxy annotations.
+            // This approach lets us capture views that we've already processed as well as views
+            // in other libraries that we wouldn't have otherwise processed.
+
+            view.viewElement.iterateSuperClasses(typeUtils) { superViewElement ->
+                val annotationsOnViewSuperClass = memoizer.getAnnotationsOnViewSuperClass(
+                    superViewElement,
+                    logger,
+                    resourceProcessor
+                )
+
+                val isSamePackage by lazy {
+                    annotationsOnViewSuperClass.viewPackageName == elementUtils.getPackageOf(view.viewElement).qualifiedName
+                }
+
+                fun forEachElementWithAnnotation(
+                    annotations: List<KClass<out Annotation>>,
+                    function: (Memoizer.ViewElement) -> Unit
+                ) {
+                    val javaAnnotations = annotations.map { it.java }
+
+                    annotationsOnViewSuperClass.annotatedElements
+                        .filterKeys { annotation ->
+                            annotation in javaAnnotations
+                        }
+                        .values
+                        .flatten()
+                        .filter { viewElement ->
+                            isSamePackage || !viewElement.isPackagePrivate
+                        }
+                        .forEach {
+                            function(it)
+                        }
+                }
+
+                forEachElementWithAnnotation(modelPropAnnotations) {
+                    // todo Include view interfaces for the super class in this model
+                    // 1. we should only do that if all methods in the super class are accessible to this (ie not package private and in a different package)
+                    // 2. We also need to handle the case the that super view is abstract - right now interfaces are not generated for abstract views
+                    // 3. If an abstract view only implements part of the interface it would mess up the way we check which methods count in the interface
+
+                    // We don't want the attribute from the super class replacing an attribute in the
+                    // subclass if the subclass overrides it, since the subclass definition could include
+                    // different annotation parameter settings, or we could end up with duplicates
+                    view.addAttributeIfNotExists(it.attributeInfo.value)
+                }
+
+                forEachElementWithAnnotation(listOf(OnViewRecycled::class)) {
+                    view.addOnRecycleMethod(it.simpleName)
+                }
+
+                forEachElementWithAnnotation(listOf(OnVisibilityStateChanged::class)) {
+                    view.addOnVisibilityStateChangedMethod(it.simpleName)
+                }
+
+                forEachElementWithAnnotation(listOf(OnVisibilityChanged::class)) {
+                    view.addOnVisibilityChangedMethod(it.simpleName)
+                }
+
+                forEachElementWithAnnotation(listOf(AfterPropsSet::class)) {
+                    view.addAfterPropsSetMethod(it.simpleName)
+                }
+            }
+        }
+    }
+
+    /**
+     * If a view defines a base model that its generated model should extend we need to check if that
+     * base model has [com.airbnb.epoxy.EpoxyAttribute] fields and include those in our model if
+     * so.
+     */
+    private suspend fun updatesViewsForInheritedBaseModelAttributes() {
+        modelClassMap.values.forEach("updatesViewsForInheritedBaseModelAttributes") { modelViewInfo ->
+            // Skip generated model super classes since it will already contain all of the functions
+            // necessary for included attributes, and duplicating them is a waste.
+            if (modelViewInfo.isSuperClassAlsoGenerated) return@forEach
+
+            memoizer.getInheritedEpoxyAttributes(
+                modelViewInfo.superClassElement.asType(),
+                modelViewInfo.generatedName.packageName(),
+                logger
+            ).let { modelViewInfo.addAttributes(it) }
+        }
+    }
+
+    private suspend fun addStyleAttributes() {
+        modelClassMap
+            .values
+            .filter("addStyleAttributes") { it.viewElement.hasStyleableAnnotation(elementUtils) }
+            .also { styleableModelsToWrite.addAll(it) }
+    }
+
+    private fun validateResetElement(resetMethod: Element): Boolean =
+        validateExecutableElement(resetMethod, OnViewRecycled::class.java, 0)
+
+    private fun validateVisibilityStateChangedElement(visibilityMethod: Element): Boolean =
+        validateExecutableElement(
+            visibilityMethod,
+            OnVisibilityStateChanged::class.java,
+            1,
+            checkTypeParameters = listOf(TypeKind.INT)
         )
 
-        assert_().about(javaSources())
-            .that(listOf(baseModel, model, configClass, R))
-            .processedWith(processors())
-            .compilesWithoutError()
-            .and()
-            .generatesSources(generatedModel)
-    }
-
-    @Test
-    fun throwsIfBaseModelNotEpoxyModelInPackageConfig() {
-        val model = JavaFileObjects
-            .forResource("BaseModelView.java".patchResource())
-
-        val baseModel = JavaFileObjects
-            .forSourceLines(
-                "com.airbnb.epoxy.TestBaseModel",
-                "package com.airbnb.epoxy;\n" +
-                    "\n" +
-                    "public abstract class TestBaseModel{\n" +
-                    "}\n"
-            )
-
-        val configClass = JavaFileObjects.forSourceString(
-            "com.airbnb.epoxy.EpoxyModelViewConfig",
-            """
-                    package com.airbnb.epoxy;
-                    
-                    import com.airbnb.epoxy.PackageModelViewConfig;
-                    import com.airbnb.epoxy.R;
-                    import com.airbnb.epoxy.TestBaseModel;
-                    
-                    @PackageModelViewConfig(rClass = R.class, defaultBaseModelClass = TestBaseModel.class)
-                    interface EpoxyModelViewConfig {}
-            """.trimIndent()
+    private fun validateVisibilityChangedElement(visibilityMethod: Element): Boolean =
+        validateExecutableElement(
+            visibilityMethod,
+            OnVisibilityChanged::class.java,
+            4,
+            checkTypeParameters = listOf(TypeKind.FLOAT, TypeKind.FLOAT, TypeKind.INT, TypeKind.INT)
         )
 
-        assert_().about(javaSources())
-            .that(listOf(baseModel, model, configClass, R))
-            .processedWith(processors())
-            .failsToCompile()
-            .withErrorContaining(
-                "The base model provided to an ModelView must extend EpoxyModel"
-            )
+    private suspend fun writeJava() {
+        val modelsToWrite = modelClassMap.values.toMutableList()
+        modelsToWrite.removeAll(styleableModelsToWrite)
+
+        styleableModelsToWrite.filter("addStyleBuilderAttributes") {
+            tryAddStyleBuilderAttribute(it, elementUtils, typeUtils)
+        }.let {
+            modelsToWrite.addAll(it)
+            styleableModelsToWrite.removeAll(it)
+        }
+
+        ModelViewWriter(modelWriter, typeUtils, elementUtils, this)
+            .writeModels(modelsToWrite, originatingConfigElements())
+
+        if (styleableModelsToWrite.isEmpty()) {
+            // Make sure all models have been processed and written before we generate interface information
+            modelWriter.writeFilesForViewInterfaces()
+        }
     }
 
-    @Test
-    fun rLayoutInViewModelAnnotationWorks() {
-        val model = JavaFileObjects
-            .forSourceLines(
-                "com.airbnb.epoxy.RLayoutInViewModelAnnotationWorksView",
-                "package com.airbnb.epoxy;\n" +
-                    "\n" +
-                    "import android.content.Context;\n" +
-                    "import android.view.View;\n" +
-                    "\n" +
-                    "@ModelView(defaultLayout = R.layout.res)\n" +
-                    "public class RLayoutInViewModelAnnotationWorksView extends View {\n" +
-                    "\n" +
-                    "  public RLayoutInViewModelAnnotationWorksView(Context context) {\n" +
-                    "    super(context);\n" +
-                    "  }\n" +
-                    "}"
-            )
-
-        val generatedModel = JavaFileObjects.forResource(
-            "RLayoutInViewModelAnnotationWorksViewModel_.java".patchResource()
-        )
-
-        assert_().about(javaSources())
-            .that(listOf(model, R))
-            .processedWith(processors())
-            .compilesWithoutError()
-            .and()
-            .generatesSources(generatedModel)
-    }
-
-    @Test
-    fun packageLayoutPatternDefault() {
-        val model = JavaFileObjects
-            .forSourceLines(
-                "com.airbnb.epoxy.DefaultPackageLayoutPatternView",
-                "package com.airbnb.epoxy;\n" +
-                    "\n" +
-                    "import android.content.Context;\n" +
-                    "import android.view.View;\n" +
-                    "\n" +
-                    "@ModelView\n" +
-                    "public class DefaultPackageLayoutPatternView extends View {\n" +
-                    "\n" +
-                    "  public DefaultPackageLayoutPatternView(Context context) {\n" +
-                    "    super(context);\n" +
-                    "  }\n" +
-                    "\n" +
-                    "}"
-            )
-
-        val R = JavaFileObjects.forSourceString(
-            "com.airbnb.epoxy.R",
-            "" +
-                "package com.airbnb.epoxy;\n" +
-                "public final class R {\n" +
-                "  public static final class layout {\n" +
-                "    public static final int default_package_layout_pattern_view = 0x7f040008;\n" +
-                "  }\n" +
-                "}"
-        )
-
-        val configClass = JavaFileObjects.forSourceString(
-            "com.airbnb.epoxy.EpoxyModelViewConfig",
-            """
-                    package com.airbnb.epoxy;
-                    
-                    import com.airbnb.epoxy.PackageModelViewConfig;
-                    import com.airbnb.epoxy.R;
-                    
-                    @PackageModelViewConfig(rClass = R.class)
-                    interface EpoxyModelViewConfig {}
-            """.trimIndent()
-        )
-
-        val generatedModel = JavaFileObjects.forResource(
-            "DefaultPackageLayoutPatternViewModel_.java".patchResource()
-        )
-
-        assert_().about(javaSources())
-            .that(listOf(model, configClass, R))
-            .processedWith(processors())
-            .compilesWithoutError()
-            .and()
-            .generatesSources(generatedModel)
-    }
-
-    @Test
-    fun packageLayoutPatternDefaultWithR2() {
-        val model = JavaFileObjects
-            .forSourceLines(
-                "com.airbnb.epoxy.DefaultPackageLayoutPatternView",
-                "package com.airbnb.epoxy;\n" +
-                    "\n" +
-                    "import android.content.Context;\n" +
-                    "import android.view.View;\n" +
-                    "\n" +
-                    "@ModelView\n" +
-                    "public class DefaultPackageLayoutPatternView extends View {\n" +
-                    "\n" +
-                    "  public DefaultPackageLayoutPatternView(Context context) {\n" +
-                    "    super(context);\n" +
-                    "  }\n" +
-                    "\n" +
-                    "}"
-            )
-
-        val R2 = JavaFileObjects.forSourceString(
-            "com.airbnb.epoxy.R2",
-            "" +
-                "package com.airbnb.epoxy;\n" +
-                "public final class R2 {\n" +
-                "  public static final class layout {\n" +
-                "    public static final int default_package_layout_pattern_view = 0x7f040008;\n" +
-                "  }\n" +
-                "}"
-        )
-
-        val R = JavaFileObjects.forSourceString(
-            "com.airbnb.epoxy.R",
-            "" +
-                "package com.airbnb.epoxy;\n" +
-                "public final class R {\n" +
-                "  public static final class layout {\n" +
-                "    public static final int default_package_layout_pattern_view = 0x7f040008;\n" +
-                "  }\n" +
-                "}"
-        )
-
-        val configClass = JavaFileObjects.forSourceString(
-            "com.airbnb.epoxy.EpoxyModelViewConfig",
-            """
-                    package com.airbnb.epoxy;
-                    
-                    import com.airbnb.epoxy.PackageModelViewConfig;
-                    import com.airbnb.epoxy.R2;
-                    
-                    @PackageModelViewConfig(rClass = R2.class)
-                    interface EpoxyModelViewConfig {}
-            """.trimIndent()
-        )
-
-        val generatedModel = JavaFileObjects.forResource(
-            "DefaultPackageLayoutPatternViewModel_.java".patchResource()
-        )
-
-        assert_().about(javaSources())
-            .that(listOf(model, configClass, R2, R))
-            .processedWith(processors())
-            .compilesWithoutError()
-            .and()
-            .generatesSources(generatedModel)
-    }
-
-    @Test
-    fun packageLayoutCustomPattern() {
-        val model = JavaFileObjects
-            .forSourceLines(
-                "com.airbnb.epoxy.CustomPackageLayoutPatternView",
-                "package com.airbnb.epoxy;\n" +
-                    "\n" +
-                    "import android.content.Context;\n" +
-                    "import android.view.View;\n" +
-                    "\n" +
-                    "@ModelView\n" +
-                    "public class CustomPackageLayoutPatternView extends View {\n" +
-                    "\n" +
-                    "  public CustomPackageLayoutPatternView(Context context) {\n" +
-                    "    super(context);\n" +
-                    "  }\n" +
-                    "\n" +
-                    "}"
-            )
-
-        val R = JavaFileObjects.forSourceString(
-            "com.airbnb.epoxy.R",
-            "" +
-                "package com.airbnb.epoxy;\n" +
-                "public final class R {\n" +
-                "  public static final class layout {\n" +
-                "    public static final int hello_custom_package_layout_pattern_view_me = " +
-                "0x7f040008;\n" +
-                "  }\n" +
-                "}"
-        )
-
-        val configClass = JavaFileObjects.forSourceString(
-            "com.airbnb.epoxy.EpoxyModelViewConfig",
-            """
-                    package com.airbnb.epoxy;
-                    
-                    import com.airbnb.epoxy.PackageModelViewConfig;
-                    import com.airbnb.epoxy.R;
-                    
-                    @PackageModelViewConfig(rClass = R.class, defaultLayoutPattern = "hello_%s_me")
-                    interface EpoxyModelViewConfig {}
-            """.trimIndent()
-        )
-
-        val generatedModel = JavaFileObjects.forResource(
-            "CustomPackageLayoutPatternViewModel_.java".patchResource()
-        )
-
-        assert_().about(javaSources())
-            .that(listOf(model, configClass, R))
-            .processedWith(processors())
-            .compilesWithoutError()
-            .and()
-            .generatesSources(generatedModel)
-    }
-
-    @Test
-    fun layoutOverloads() {
-        val model = JavaFileObjects
-            .forSourceLines(
-                "com.airbnb.epoxy.LayoutOverloadsView",
-                "package com.airbnb.epoxy;\n" +
-                    "\n" +
-                    "import android.content.Context;\n" +
-                    "import android.view.View;\n" +
-                    "\n" +
-                    "@ModelView\n" +
-                    "public class LayoutOverloadsView extends View {\n" +
-                    "\n" +
-                    "  public LayoutOverloadsView(Context context) {\n" +
-                    "    super(context);\n" +
-                    "  }\n" +
-                    "\n" +
-                    "}"
-            )
-
-        val R = JavaFileObjects.forSourceString(
-            "com.airbnb.epoxy.R",
-            "" +
-                "package com.airbnb.epoxy;\n" +
-                "public final class R {\n" +
-                "  public static final class layout {\n" +
-                "    public static final int layout_overloads_view = 0x7f040008;\n" +
-                "    public static final int layout_overloads_view_one = 0x7f040009;\n" +
-                "    public static final int layout_overloads_view_two = 0x7f04000a;\n" +
-                "  }\n" +
-                "}"
-        )
-
-        val configClass = JavaFileObjects.forSourceString(
-            "com.airbnb.epoxy.EpoxyModelViewConfig",
-            """
-                    package com.airbnb.epoxy;
-                    
-                    import com.airbnb.epoxy.PackageModelViewConfig;
-                    import com.airbnb.epoxy.R;
-                    
-                    @PackageModelViewConfig(rClass = R.class, useLayoutOverloads = true)
-                    interface EpoxyModelViewConfig {}
-            """.trimIndent()
-        )
-
-        val generatedModel = JavaFileObjects.forResource(
-            "LayoutOverloadsViewModel_.java".patchResource()
-        )
-
-        assert_().about(javaSources())
-            .that(listOf(model, configClass, R))
-            .processedWith(processors())
-            .compilesWithoutError()
-            .and()
-            .generatesSources(generatedModel)
-    }
-
-    @Test
-    fun generatedModelSuffix() {
-        val model = JavaFileObjects.forSourceLines(
-            "com.airbnb.epoxy.GeneratedModelSuffixView",
-            "package com.airbnb.epoxy;\n" +
-                "\n" +
-                "import android.content.Context;\n" +
-                "import android.view.View;\n" +
-                "\n" +
-                "@ModelView\n" +
-                "public class GeneratedModelSuffixView extends View {\n" +
-                "\n" +
-                "  public GeneratedModelSuffixView(Context context) {\n" +
-                "    super(context);\n" +
-                "  }\n" +
-                "\n" +
-                "}"
-        )
-
-        val R = JavaFileObjects.forSourceString(
-            "com.airbnb.epoxy.R",
-            "" +
-                "package com.airbnb.epoxy;\n" +
-                "public final class R {\n" +
-                "  public static final class layout {\n" +
-                "    public static final int generated_model_suffix_view = 0x7f040008;\n" +
-                "  }\n" +
-                "}"
-        )
-
-        val configClass = JavaFileObjects.forSourceString(
-            "com.airbnb.epoxy.EpoxyModelViewConfig",
-            """
-                    package com.airbnb.epoxy;
-                    
-                    import com.airbnb.epoxy.PackageModelViewConfig;
-                    import com.airbnb.epoxy.R;
-                    
-                    @PackageModelViewConfig(rClass = R.class, generatedModelSuffix = "Suffix_")
-                    interface EpoxyModelViewConfig {}
-            """.trimIndent()
-        )
-
-        assertGeneration(
-            sourceObjects = listOf(model, configClass, R),
-            generatedFileNames = listOf("GeneratedModelSuffixViewSuffix_.java")
-        )
-    }
-
-    @Test
-    fun afterBindProps() {
-        val model = JavaFileObjects
-            .forResource("TestAfterBindPropsView.java".patchResource())
-
-        val superModel = JavaFileObjects
-            .forResource("TestAfterBindPropsSuperView.java".patchResource())
-
-        val generatedModel =
-            JavaFileObjects.forResource("TestAfterBindPropsViewModel_.java".patchResource())
-
-        assert_().about(javaSources())
-            .that(listOf(model, superModel))
-            .processedWith(processors())
-            .compilesWithoutError()
-            .and()
-            .generatesSources(generatedModel)
-    }
-
-    @Test
-    fun textProp() {
-        assertGeneration("TestTextPropView.java", "TestTextPropViewModel_.java")
-    }
-
-    @Test
-    fun textPropMustBeCharSequence() {
-        assertGenerationError("TestTextPropMustBeCharSequenceView.java", "must be a CharSequence")
-    }
-
-    @Test
-    fun textPropDefault() {
-        val model = JavaFileObjects
-            .forResource("TextPropDefaultView.java".patchResource())
-
-        val generatedModel =
-            JavaFileObjects.forResource("TextPropDefaultViewModel_.java".patchResource())
-
-        assert_().about(javaSources())
-            .that(listOf(model, R))
-            .processedWith(processors())
-            .compilesWithoutError()
-            .and()
-            .generatesSources(generatedModel)
-    }
-
-    @Test
-    fun textPropDefault_throwsForNonStringRes() {
-        val model = JavaFileObjects
-            .forResource("TextPropDefaultView_throwsForNonStringRes.java".patchResource())
-
-        assert_().about(javaSources())
-            .that(listOf(model, R))
-            .processedWith(processors())
-            .failsToCompile()
-            .withErrorContaining("requires a string resource")
-    }
-
-    @Test
-    fun callbackProp() {
-        assertGeneration("TestCallbackPropView.java", "TestCallbackPropViewModel_.java")
-    }
-
-    @Test
-    fun callbackPropMustBeNullable() {
-        assertGenerationError("TestCallbackPropMustBeNullableView.java", "must be marked Nullable")
-    }
-
-    @Test
-    fun testModelBuilderInterface() {
-        assertGeneration("TestManyTypesView.java", "TestManyTypesViewModelBuilder.java")
-    }
-
-    @Test
-    fun testAutoLayout() {
-        assertGeneration("AutoLayoutModelView.java", "AutoLayoutModelViewModel_.java")
-    }
-
-    @Test
-    fun testAutoLayoutMatchParent() {
-        assertGeneration(
-            "AutoLayoutModelViewMatchParent.java",
-            "AutoLayoutModelViewMatchParentModel_.java"
-        )
-    }
-
-    @Test
-    fun testModelViewInheritsFromSuperClass() {
-        assertViewsHaveModelsGenerated(
-            "ModelViewSuperClass.java",
-            "ModelViewExtendingSuperClass.java"
-        )
-    }
-
-    @Test
-    fun testFieldPropModelProp() {
-        assertGeneration("TestFieldPropModelPropView.java", "TestFieldPropModelPropViewModel_.java")
-    }
-
-    @Test
-    fun testFieldPropTextProp() {
-        assertGeneration("TestFieldPropTextPropView.java", "TestFieldPropTextPropViewModel_.java")
-    }
-
-    @Test
-    fun testFieldPropCallbackProp() {
-        assertGeneration(
-            "TestFieldPropCallbackPropView.java",
-            "TestFieldPropCallbackPropViewModel_.java"
-        )
-    }
-
-    @Test
-    fun testFieldPropDoNotHashOption() {
-        assertGeneration(
-            "TestFieldPropDoNotHashOptionView.java",
-            "TestFieldPropDoNotHashOptionViewModel_.java"
-        )
-    }
-
-    @Test
-    fun testFieldPropGenerateStringOverloadsOption() {
-        assertGeneration(
-            "TestFieldPropGenerateStringOverloadsOptionView.java",
-            "TestFieldPropGenerateStringOverloadsOptionViewModel_.java"
-        )
-    }
-
-    @Test
-    fun testFieldPropNullOnRecycleOption() {
-        assertGeneration(
-            "TestFieldPropNullOnRecycleOptionView.java",
-            "TestFieldPropNullOnRecycleOptionViewModel_.java"
-        )
-    }
-
-    @Test
-    fun testFieldPropIgnoreRequireHashCodeOption() {
-        assertGeneration(
-            "TestFieldPropIgnoreRequireHashCodeOptionView.java",
-            "TestFieldPropIgnoreRequireHashCodeOptionViewModel_.java"
-        )
-    }
-
-    @Test
-    fun testFieldPropInheritFromParentView() {
-        assertGeneration(
-            listOf("TestFieldPropChildView.java", "TestFieldPropParentView.java"),
-            listOf("TestFieldPropChildViewModel_.java")
-        )
-    }
-
-    @Test
-    fun testFieldPropThrowsIfPrivate() {
-        assertGenerationError("TestFieldPropThrowsIfPrivateView.java", "private")
-    }
-
-    @Test
-    fun testFieldPropThrowsIfStatic() {
-        assertGenerationError("TestFieldPropThrowsIfStaticView.java", "static")
-    }
-
-    @Test
-    fun testFieldPropStringOverloadsIfNotCharSequence() {
-        assertGenerationError(
-            "TestFieldPropStringOverloadsIfNotCharSequenceView.java",
-            "must be a CharSequence"
-        )
-    }
-
-    @Test
-    fun testFieldPropTextPropIfNotCharSequence() {
-        assertGenerationError("TestTextPropIfNotCharSequenceView.java", "must be a CharSequence")
-    }
-
-    @Test
-    fun testStyleableView() {
-        val configClass: JavaFileObject = JavaFileObjects
-            .forSourceLines(
-                "com.airbnb.epoxy.package-info",
-                "@ParisConfig(rClass = R.class)\n" +
-                    "package com.airbnb.epoxy;\n" +
-                    "\n" +
-                    "import com.airbnb.paris.annotations.ParisConfig;\n" +
-                    "import com.airbnb.epoxy.R;\n"
-            )
-
-        assertGeneration(
-            inputFile = "ModelViewWithParis.java",
-            generatedFile = "ModelViewWithParisModel_.java",
-            useParis = true,
-            helperObjects = listOf(configClass, R)
-        )
-    }
-
-    private fun assertViewsHaveModelsGenerated(vararg viewFiles: String) {
-        assertGeneration(viewFiles.toList(), viewFiles.map { it.replace(".", "Model_.") })
-    }
+    private fun getModelInfoForPropElement(element: Element): ModelViewInfo? =
+        element.enclosingElement?.let { modelClassMap[it] }
 
     companion object {
-
-        private val R: JavaFileObject = JavaFileObjects.forSourceString(
-            "com.airbnb.epoxy.R",
-            "" +
-                "package com.airbnb.epoxy;\n" +
-                "public final class R {\n" +
-                "  public static final class layout {\n" +
-                "    public static final int res = 0x7f040008;\n" +
-                "  }\n" +
-                "  public static final class string {\n" +
-                "    public static final int string_resource_value = 0x7f040009;\n" +
-                "  }\n" +
-                "}"
+        val modelPropAnnotations = listOf(
+            ModelProp::class,
+            TextProp::class,
+            CallbackProp::class
         )
     }
 }
